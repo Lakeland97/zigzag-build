@@ -24,8 +24,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     let sidebar = SidebarView()
     /// The live second sidebar the hot screen edge shows (#363), made the first time it comes out.
     private(set) var edgeSidebar: SidebarView?
-    /// The floating Mini the edge sidebar borrowed a tab into, if one is out.
-    private var edgeMini: MiniWindowController?
+    /// The floating sidebar container the edge panel shows, if it has been made.
     private var edgeContainer: SidebarContainer?
     /// The panel's Site Controls host, kept for as long as its panel is open.
     private var edgeSiteHost: EdgeSitePanelHost?
@@ -2854,8 +2853,8 @@ extension BrowserWindowController: TabHost {
         let flags = action.modifierFlags
         let background = flags.contains(.command) && !flags.contains(.shift)
         let newTab = tabManager.newTab(url: nil, select: !background, configuration: configuration, opener: tab, site: action.request.url)
-        if EdgePeekRouting.newPage(peekVisible: EdgePeek.shared.isVisible) == .peek {
-            EdgePeek.shared.show(tab: newTab, from: self)
+        if EdgePeekRouting.newPage(peekVisible: EdgePeek.shared.isVisible) == .peek, !background {
+            EdgePeek.shared.show(tab: newTab, from: self, replacing: true)
         }
         return newTab.ensureWebView()
     }
@@ -3845,7 +3844,7 @@ extension BrowserWindowController: CommandBarHost {
         guard edgeCommandBarInPlace else { return }
         if EdgePeekRouting.newPage(peekVisible: EdgePeek.shared.isVisible) == .peek,
            let tab = tabManager.selectedTab {
-            EdgePeek.shared.show(tab: tab, from: self)
+            EdgePeek.shared.show(tab: tab, from: self, replacing: true)
         } else {
             bringForwardForEdge()
         }
@@ -3879,8 +3878,12 @@ extension BrowserWindowController {
         mirror.list.onOpenBookmark = { [weak self] bookmark in self?.openBookmarkFromEdgeSidebar(bookmark) }
         // Its New Tab row opens the browser's bar over the screen, not in the window behind the panel.
         mirror.list.onNewTab = { EdgeSidebar.shared.newTabInPlace() }
-        // A click on empty space puts the panel away, as the pointer leaving it does.
-        mirror.blankClick = { EdgeSidebar.shared.hide() }
+        // A click on empty space is a sidebar action: it closes the lens and keeps the panel; with no lens, it puts
+        // the panel away, as the pointer leaving it does.
+        mirror.blankClick = {
+            if EdgePeek.shared.isVisible { EdgePeek.shared.dismiss(.sidebarClick) }
+            else { EdgeSidebar.shared.hide() }
+        }
         // A mirror, not a window's sidebar: no bar to lend its address buttons to, and no close button, since
         // moving the pointer away is what puts the panel back.
         mirror.hasTopBar = false
@@ -3890,8 +3893,8 @@ extension BrowserWindowController {
         // Hovering a row shows its still page beside it, in the panel's own window: the browser window's overlay is
         // behind another app while the panel is out.
         mirror.list.onHoverTab = { [weak self] tab, rect in
-            guard let self, let tab, let rect, self.edgeMini == nil, !EdgePeek.shared.isVisible else {
-                EdgePeekPreview.shared.hide()
+            guard let self, let tab, let rect, !EdgePeek.shared.isVisible else {
+                EdgePeekPreview.shared.pointerLeftRow()
                 return
             }
             EdgePeekPreview.shared.hover(tab: tab, at: rect)
@@ -4038,48 +4041,30 @@ extension BrowserWindowController {
         }
     }
 
-    /// A tab picked in the edge sidebar is borrowed into a floating Mini beside it; a favorite or a page Mini can't
-    /// take brings the window forward on it. Either way the panel goes at once, unless it is the same tab again.
+    /// The lens's entry point from the preview or a row.
+    func openEdgeLens(for tab: Tab) {
+        pickFromEdgeSidebar(tab)
+    }
+
+    /// A tab picked in the edge sidebar opens the lens beside it; a favorite or a page the lens can't take brings the
+    /// window forward on it. The lens is one action: a click while it is open closes it and opens nothing else.
     private func pickFromEdgeSidebar(_ tab: Tab) {
-        // The tab that is already out goes back: the same click opens and closes the Mini.
-        if let mini = edgeMini {
-            edgeMini = nil
-            let same = mini.tab === tab
-            mini.closeBorrowed()
-            setEdgePeek(nil)
-            EdgeSidebar.shared.holdForPeek(false)
-            if same { return }
+        if EdgePeek.shared.isVisible {
+            EdgePeek.shared.dismiss(EdgePeek.shared.tab === tab ? .sameTab : .sidebarClick)
+            return
         }
         // Any page can be borrowed, pinned or private or Zigzag's own, as the person asked. One that has no web view
         // yet (a just-opened tab, a picked pinned page never looked at) is made here first, beside the panel.
-        guard tab.url != nil, let sidebarFrame = EdgeSidebar.shared.sidebarCardScreenFrame else {
+        guard tab.url != nil, EdgeSidebar.shared.sidebarCardScreenFrame != nil else {
             bringForwardForEdge()
             return
         }
         if MiniWindowController.needsPage(tab) { tab.reload() }
-        if EdgePeek.shared.isVisible { EdgePeek.shared.close() }
-        let screen = NSScreen.screens.first { $0.visibleFrame.intersects(sidebarFrame) } ?? NSScreen.main
-        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let frame = EdgePeekLayout.pageFrame(beside: sidebarFrame, in: visible,
-                                             onRight: EdgeSidebar.shared.panelOnRight)
-        let mini = MiniWindowController.open(borrowing: tab, from: self, origin: sidebarFrame, frame: frame,
-                                             overFullScreen: true, floating: true)
-        edgeMini = mini
-        mini.onBorrowedClose = { [weak self, weak mini] in
-            guard let self, let mini, self.edgeMini === mini else { return }
-            self.edgeMini = nil
-            self.setEdgePeek(nil)
-            EdgeSidebar.shared.holdForPeek(false)
-            // The page went back on its own (Esc, a click away, Return): the panel goes with it. Picking the same
-            // row again clears `edgeMini` first, so the panel stays for that toggle.
-            EdgeSidebar.shared.hide(animated: false)
-        }
-        setEdgePeek(tab.id)
-        EdgeSidebar.shared.holdForPeek(true)
+        EdgePeek.shared.show(tab: tab, from: self)
     }
 
-    /// The page the edge panel is showing: the popout's, or the one the panel's rows are on.
-    var edgePanelTab: Tab? { edgeMini?.tab ?? EdgePeek.shared.tab ?? tabManager.selectedTab }
+    /// The page the edge panel is showing: the lens's, or the one the panel's rows are on.
+    var edgePanelTab: Tab? { EdgePeek.shared.tab ?? tabManager.selectedTab }
 
     /// A pinned page picked in the edge panel: its live tab, opened in the popout like a tab row.
     private func openBookmarkFromEdgeSidebar(_ bookmark: Bookmark) {
@@ -4104,16 +4089,10 @@ extension BrowserWindowController {
         SitePanel.toggle(in: host, from: button)
     }
 
-    /// The panel went away: the popout and its site panel go with it, whichever of them was out.
+    /// The panel went away: the lens and its site panel go with it, whichever of them was out.
     func edgePopoutDidDismiss() {
         if SitePanel.isOpen(in: EdgeSidebar.shared.panelWindow) { SitePanel.closeCurrent() }
-        if let mini = edgeMini {
-            edgeMini = nil
-            mini.closeBorrowed()
-            setEdgePeek(nil)
-            EdgeSidebar.shared.holdForPeek(false)
-        }
-        if EdgePeek.shared.isVisible { EdgePeek.shared.close(duration: 0.15) }
+        if EdgePeek.shared.isVisible { EdgePeek.shared.dismiss(.windowClose) }
     }
 
     /// Return or Expand from the edge overlay: the browser takes the display with its own full screen, and the app

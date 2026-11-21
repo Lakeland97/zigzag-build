@@ -112,6 +112,8 @@ final class EdgeSidebar {
     private var holdsForPeek = false
     /// The visible frame of the screen the panel is on, while it's out.
     private var shownScreen: NSRect?
+    /// The side the panel last came out on, so it slides back the same way after its window has gone.
+    private var lastPanelWasOnRight = false
     private var decideTimer: Timer?
     private var followTimer: Timer?
     private var monitors: [Any] = []
@@ -173,13 +175,25 @@ final class EdgeSidebar {
             MainActor.assumeIsolated { self?.moved(event) }
             return event
         }) { monitors.append(local) }
+        // Esc puts the panel away. The lens consumes its own Esc first; once it has collapsed, the next Esc is the
+        // sidebar's. A field being edited keeps its Esc to cancel the edit.
+        if let esc = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            let handled = MainActor.assumeIsolated {
+                guard let self, event.keyCode == 53, self.panel?.isKeyWindow == true,
+                      !self.isCommandBarOpen else { return false }
+                if self.panel?.firstResponder is NSTextView { return false }
+                self.hide()
+                return true
+            }
+            return handled ? nil : event
+        }) { monitors.append(esc) }
         target = WindowManager.shared.keyController ?? target
     }
 
     private func stop() {
         monitors.forEach(NSEvent.removeMonitor)
         monitors = []
-        hide(animated: false)
+        hide(animated: false, force: true)
         target = nil
     }
 
@@ -188,6 +202,35 @@ final class EdgeSidebar {
 
     /// The Peek keeps the panel out while its page is attached, whatever the pointer does.
     func holdForPeek(_ hold: Bool) { holdsForPeek = hold }
+
+    /// Whether the pointer is still in the strip that keeps the panel out.
+    var pointerInEdgeZone: Bool {
+        guard isShowing, let visible = shownScreen, let zone = zone(in: visible) else { return false }
+        return zone.keeps(at: EdgeSidebarLayout.point(NSEvent.mouseLocation, in: visible))
+    }
+
+    /// Whether the panel could stay out at all: the browser coming forward takes that away.
+    var canStayOut: Bool { !isBrowserInFront }
+
+    /// The edge panel takes the keyboard back after the lens closes without hiding it.
+    func makeKey() {
+        guard isShowing else { return }
+        panel?.makeKey()
+    }
+
+    /// A preview or a row was clicked: the lens opens for that tab.
+    func openLens(for tab: Tab) {
+        target?.openEdgeLens(for: tab)
+    }
+
+    /// Whether a click in the panel is one of the list's own actions (a row, New Tab, blank space), which closes the
+    /// lens, rather than one of the sidebar's controls (back, reload, the address) that act on the lens instead.
+    func clickClosesLens(at point: NSPoint) -> Bool {
+        guard let target else { return true }
+        let (sidebar, _) = target.edgeSidebarForDisplay()
+        let list = sidebar.list
+        return list.convert(list.bounds, to: nil).contains(point)
+    }
 
     /// The panel's window, so the Peek can tell a click on the sidebar from a click outside.
     var panelWindow: NSWindow? { panel }
@@ -214,8 +257,8 @@ final class EdgeSidebar {
 
     func windowClosed(_ controller: BrowserWindowController) {
         guard target === controller else { return }
+        hide(animated: false, force: true)
         target = nil
-        hide(animated: false)
     }
 
     // MARK: The pointer
@@ -298,8 +341,9 @@ final class EdgeSidebar {
 
     private func follow() {
         guard isShowing, let visible = shownScreen, let zone = zone(in: visible) else { return }
-        // The page is attached beside the panel: the pointer is over the page, not the panel, and the panel stays.
-        guard !holdsForPeek else { return }
+        // The page is attached beside the panel, or the preview card is out: the pointer is over them, not the panel,
+        // and the panel stays.
+        guard !holdsForPeek, !EdgePeekPreview.shared.isVisible else { return }
         // Zigzag came forward, or the window's sidebar came out: the panel has nothing left to show.
         guard let target, EdgeSidebarLayout.canShow(appIsActive: isBrowserInFront) else {
             hide()
@@ -375,6 +419,7 @@ final class EdgeSidebar {
         let (sidebar, container) = target.edgeSidebarForDisplay()
         target.prepareEdgeSidebar()
         let onRight = target.edgeSidebarOnRight
+        lastPanelWasOnRight = onRight
         // The card keeps the window's sidebar's width; the panel is that and the gutter it stands off the edge by.
         let width = target.edgeSidebarWidth + Tokens.Metric.cardInset
         let panel = panel ?? makePanel()
@@ -416,7 +461,12 @@ final class EdgeSidebar {
     }
 
     /// Puts the panel away. Without the slide for a pick, so its window can come forward at once.
-    func hide(animated: Bool = true) {
+    func hide(animated: Bool = true, force: Bool = false) {
+        // The preview is the closed lens: it goes whenever the panel goes.
+        EdgePeekPreview.shared.hide()
+        // The lens and the sidebar are one session: the lens collapses first, and only then does the sidebar follow.
+        // A stop or a closed window is the exception: there is nothing left to follow.
+        guard force || !EdgeLensPolicy.blocksSidebarHide(lensOpen: EdgePeek.shared.isVisible) else { return }
         // The panel's popout is its page: it goes with the panel, however the panel goes.
         target?.edgePopoutDidDismiss()
         stopDeciding(dismiss: true)
@@ -438,7 +488,8 @@ final class EdgeSidebar {
         }
         guard animated else { panel.orderOut(nil); return }
         let card = host.cardFrame
-        let out = card.offsetBy(dx: target?.edgeSidebarOnRight == true ? card.width + host.inset : -(card.width + host.inset), dy: 0)
+        let onRight = target?.edgeSidebarOnRight ?? lastPanelWasOnRight
+        let out = card.offsetBy(dx: onRight ? card.width + host.inset : -(card.width + host.inset), dy: 0)
         Tokens.Motion.withoutAnimation { container.frame = out }
         let duration = Tokens.Motion.slide(container, fromOffsetX: card.minX - out.minX, curve: Tokens.Motion.edgeTuck)
         guard duration > 0 else { panel.orderOut(nil); return }
@@ -539,13 +590,15 @@ final class EdgeSidebarHost: NSView {
 @MainActor final class EdgeSitePanelHost: SitePanelPageHost {
     let tab: Tab
     let overlay: PassthroughView
+    private let hostWindow: NSWindow?
 
-    init(tab: Tab, overlay: PassthroughView) {
+    init(tab: Tab, overlay: PassthroughView, window: NSWindow? = nil) {
         self.tab = tab
         self.overlay = overlay
+        self.hostWindow = window
     }
 
-    var window: NSWindow? { EdgeSidebar.shared.panelWindow }
+    var window: NSWindow? { hostWindow ?? EdgeSidebar.shared.panelWindow }
     var listsExtensions: Bool { false }
 
     func copyPageURL(_ sender: Any?) {
