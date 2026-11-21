@@ -1547,6 +1547,8 @@ final class SidebarView: NSView {
     /// The Minis that aren't in front, in the order they opened; a row goes when its window comes forward or closes.
     private func refreshMiniWindows() {
         let shown = isPrivate ? [] : MiniWindowController.all.filter { mini in
+            // The edge sidebar's popout is the panel's page, not an ordinary Mini: it has no row here.
+            guard !mini.isEdgePopout else { return false }
             guard let window = mini.window, window.isVisible || window.isMiniaturized else { return false }
             return !window.isKeyWindow
         }
