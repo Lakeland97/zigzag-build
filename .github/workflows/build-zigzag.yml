@@ -85,7 +85,8 @@ jobs:
             -only-testing:ZigzagTests/PinnedSpaceNameTests \
             -only-testing:ZigzagTests/RowHoverTests \
             -only-testing:ZigzagTests/EdgeSidebarLayoutTests \
-            -only-testing:ZigzagTests/EdgeSidebarSettingTests | tee test.log
+            -only-testing:ZigzagTests/EdgeSidebarSettingTests \
+            -only-testing:ZigzagTests/EdgeSidebarLifecycleTests | tee test.log
           # labelsCenterTheirCapitals is upstream's own test and measures a sub-pixel offset, which rounds away on a
           # runner with no Retina display: it stands aside there itself, at the top of the test. `-skip-testing:` with
           # a single test's name is not honoured for this suite, so the test is what knows (see SettingsLayoutTests).
@@ -97,7 +98,8 @@ jobs:
           for s in DownloadRuleTests DownloadPolicyTests SitePermissionsPolicyTests PermissionPromptTests \
                    PendingQuestionsTests PageLinkTests SiteControlsPermissionTests FormSheetTests \
                    SettingsLayoutTests EdgePeekTests EdgePeekPreviewTests SidebarSideTests \
-                   PinnedSpaceNameTests RowHoverTests EdgeSidebarLayoutTests EdgeSidebarSettingTests; do
+                   PinnedSpaceNameTests RowHoverTests EdgeSidebarLayoutTests EdgeSidebarSettingTests \
+                   EdgeSidebarLifecycleTests; do
             grep -q "✔ Suite $s passed" test.log || { echo "suite did not run: $s"; exit 1; }
           done
           if grep -q "✘" test.log; then echo "a test failed"; exit 1; fi
